@@ -42,6 +42,7 @@ static apk_sign_key_t apk_sign_keys[] = {
     { EXPECTED_SIZE_RSUNTK, EXPECTED_HASH_RSUNTK },     // rsuntk/KernelSU (MKSU/RKSU)
     { EXPECTED_SIZE_SUKISU, EXPECTED_HASH_SUKISU },     // SukiSU-Ultra
     { EXPECTED_SIZE_KSUNEXT_ALT, EXPECTED_HASH_KSUNEXT_ALT }, // KernelSU-Next Alt Key
+    { EXPECTED_SIZE_WILDKSU, EXPECTED_HASH_WILDKSU },         // Wild KSU v3.1.2
 #ifdef EXPECTED_SIZE
     { EXPECTED_SIZE, EXPECTED_HASH }, // Custom
 #endif

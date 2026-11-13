@@ -98,14 +98,18 @@ static int do_get_info(void __user *arg)
 
         /*
          * Dynamic multi-manager UAPI negotiation:
-         * - BakaSU expects UAPI 6
+         * - BakaSU, FinaSU, and SukiSU expect UAPI 6
          * - KernelSU-Next v3.4.1 / v3.4.2+ expects UAPI 5
          * - KernelSU-Next v3.4.0 (e.g. spoofed yhaxhr) expects UAPI 4
          * - Official KernelSU (v0.9.x / v1.0.x) expects UAPI 4
          * - ksud daemon / root tools expect UAPI 5
          */
-        if (sig_index == 0 || strncmp(current->comm, "org.bakasu", 10) == 0) {
-            /* BakaSU native manager supports UAPI 6 */
+        if (sig_index == 0 || sig_index == 5 || sig_index == 7 ||
+            strncmp(current->comm, "org.bakasu", 10) == 0 ||
+            strncmp(current->comm, "me.yuki.fina", 12) == 0 ||
+            strstr(current->comm, "fina") != NULL ||
+            strstr(current->comm, "sukisu") != NULL) {
+            /* BakaSU, FinaSU, and SukiSU native managers require UAPI 6 */
             cmd.uapi_version = 6;
         } else if (strncmp(current->comm, "yhaxhr", 6) == 0) {
             /* KernelSU-Next v3.4.0 spoofed manager expects UAPI 4 */
@@ -133,9 +137,10 @@ static int do_get_info(void __user *arg)
         cmd.flags |= KSU_GET_INFO_FLAG_BUNDLED;
     }
 #endif
-#ifdef EXPECTED_PR_BUILD_SIZE
-    cmd.flags |= KSU_GET_INFO_FLAG_PR_BUILD;
-#endif
+    /*
+     * Production release: Do not flag KSU_GET_INFO_FLAG_PR_BUILD to prevent
+     * managers (KernelSU-Next, FinaSU) from displaying non-production warning cards.
+     */
     if (is_manager()) {
         cmd.flags |= KSU_GET_INFO_FLAG_MANAGER;
     }
@@ -181,9 +186,7 @@ static int do_get_info_legacy(void __user *arg)
     if (ksu_late_loaded) {
         cmd.flags |= KSU_GET_INFO_FLAG_LATE_LOAD;
     }
-#ifdef EXPECTED_PR_BUILD_SIZE
-    cmd.flags |= KSU_GET_INFO_FLAG_PR_BUILD;
-#endif
+    /* Production release - PR build flag suppressed */
     cmd.features = KSU_FEATURE_MAX;
 
 #ifdef CONFIG_KSU_TOOLKIT_SUPPORT
