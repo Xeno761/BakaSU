@@ -68,7 +68,42 @@ static uint32_t ksuflags_override = 0;
 
 static int do_get_info(void __user *arg)
 {
+    struct ksu_get_info_cmd in_cmd = { 0 };
     struct ksu_get_info_cmd cmd = { .version = KERNEL_SU_VERSION, .flags = 0 };
+    bool has_req_uapi = false;
+
+    if (!copy_from_user(&in_cmd, arg, sizeof(in_cmd))) {
+        /*
+         * Dynamic UAPI Negotiation:
+         * If the caller specifically requests a supported UAPI version (3..6),
+         * satisfy that request directly.
+         */
+        if (in_cmd.uapi_version >= 3 && in_cmd.uapi_version <= 6) {
+            cmd.uapi_version = in_cmd.uapi_version;
+            has_req_uapi = true;
+        }
+    }
+
+    if (!has_req_uapi) {
+        /*
+         * Fallback for callers passing 0 (such as stock ksud):
+         * Determine UAPI from crowned manager signature or default to 5.
+         */
+        int sig_index = -1;
+        if (is_manager()) {
+            sig_index = ksu_get_manager_signature_index_by_appid(ksu_get_uid_t(current_uid()) % PER_USER_RANGE);
+        } else if (ksu_last_manager_appid != KSU_INVALID_APPID) {
+            sig_index = ksu_get_manager_signature_index_by_appid(ksu_last_manager_appid);
+        }
+
+        if (sig_index == 0) {
+            /* BakaSU native manager supports UAPI 6 */
+            cmd.uapi_version = 6;
+        } else {
+            /* KernelSU-Next 3.4.2, FinaSU, Official KSU, etc. expect UAPI 5 */
+            cmd.uapi_version = 5;
+        }
+    }
 
 #ifdef MODULE
     cmd.flags |= KSU_GET_INFO_FLAG_LKM;
@@ -90,7 +125,6 @@ static int do_get_info(void __user *arg)
         cmd.flags |= KSU_GET_INFO_FLAG_PREINIT;
     }
     cmd.features = KSU_FEATURE_MAX;
-    cmd.uapi_version = KERNEL_SU_UAPI_VERSION;
 
 #ifdef CONFIG_KSU_TOOLKIT_SUPPORT
     if (ksuver_override)

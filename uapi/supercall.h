@@ -19,8 +19,8 @@
 // 4: add KSU_GET_INFO_FLAG_BUNDLED
 // 5: add EVENT_SERVICES with a start/skip result
 // 6: add KSU_IOCTL_LOOKUP_SYMBOLS and KSU_GET_INFO_FLAG_PREINIT; modules.rc and preinit may live under /metadata/vold/ksu
-// Aphelion: Advertise UAPI 5 for full KernelSU-Next Manager 3.4.2 and FinaSU compatibility
-static const __u32 KERNEL_SU_UAPI_VERSION = 5;
+// Aphelion: Dynamic multi-UAPI support (negotiates 3..6, default 5 for KSUNext/FinaSU, 6 for BakaSU)
+static const __u32 KERNEL_SU_UAPI_VERSION = 6;
 
 /* Magic numbers for reboot hook to install fd */
 DEFINE_KSU_UAPI_CONST(__u32, KSU_INSTALL_MAGIC1, 0xDEADBEEF)
