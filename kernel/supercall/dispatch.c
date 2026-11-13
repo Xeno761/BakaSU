@@ -66,6 +66,69 @@ static uint32_t ksuver_override = 0;
 static uint32_t ksuflags_override = 0;
 #endif
 
+static int detect_manager_uapi_version(void)
+{
+    struct mm_struct *mm = current->mm;
+    struct vma_iterator vmi;
+    struct vm_area_struct *vma;
+    struct file *so_file = NULL;
+    char *buf;
+    loff_t pos = 0;
+    ssize_t bytes_read;
+    int detected = -1;
+    u32 u;
+
+    if (!mm)
+        return -1;
+
+    if (!mmap_read_trylock(mm))
+        return -1;
+
+    vma_iter_init(&vmi, mm, 0);
+    for_each_vma(vmi, vma) {
+        if (vma->vm_file && vma->vm_file->f_path.dentry) {
+            const char *name = vma->vm_file->f_path.dentry->d_name.name;
+            if (name && strstr(name, "libkernelsu.so")) {
+                so_file = get_file(vma->vm_file);
+                break;
+            }
+        }
+    }
+    mmap_read_unlock(mm);
+
+    if (!so_file)
+        return -1;
+
+    buf = kmalloc(32768, GFP_KERNEL);
+    if (!buf) {
+        fput(so_file);
+        return -1;
+    }
+
+    bytes_read = ksu_kernel_read_compat(so_file, buf, 32768, &pos);
+    fput(so_file);
+
+    if (bytes_read > (ssize_t)(sizeof(u32) * 2)) {
+        for (u = 4; u <= 7; u++) {
+            u32 op_mov = 0x52800000 | (u << 5); /* mov w0, #u */
+            u32 op_ret = 0xd65f03c0;            /* ret */
+            ssize_t i;
+            for (i = 0; i <= bytes_read - 8; i += 4) {
+                u32 *p = (u32 *)(buf + i);
+                if (p[0] == op_mov && p[1] == op_ret) {
+                    detected = (int)u;
+                    break;
+                }
+            }
+            if (detected != -1)
+                break;
+        }
+    }
+
+    kfree(buf);
+    return detected;
+}
+
 static int do_get_info(void __user *arg)
 {
     struct ksu_get_info_cmd in_cmd = { 0 };
@@ -85,49 +148,58 @@ static int do_get_info(void __user *arg)
     }
 
     if (!has_req_uapi) {
-        /*
-         * Fallback for callers passing 0 (such as stock ksud):
-         * Determine UAPI from crowned manager signature or default to 5.
-         */
-        int sig_index = -1;
+        int detected_uapi = -1;
         if (is_manager()) {
-            sig_index = ksu_get_manager_signature_index_by_appid(ksu_get_uid_t(current_uid()) % PER_USER_RANGE);
-        } else if (ksu_last_manager_appid != KSU_INVALID_APPID) {
-            sig_index = ksu_get_manager_signature_index_by_appid(ksu_last_manager_appid);
+            detected_uapi = detect_manager_uapi_version();
         }
 
-        /*
-         * Dynamic multi-manager UAPI negotiation:
-         * - BakaSU, FinaSU, and SukiSU expect UAPI 6
-         * - KernelSU-Next v3.4.1 / v3.4.2+ expects UAPI 5
-         * - KernelSU-Next v3.4.0 (e.g. spoofed yhaxhr) expects UAPI 4
-         * - Official KernelSU (v0.9.x / v1.0.x) expects UAPI 4
-         * - ksud daemon / root tools expect UAPI 5
-         */
-        if (sig_index == 0 || sig_index == 5 || sig_index == 7 ||
-            strncmp(current->comm, "org.bakasu", 10) == 0 ||
-            strncmp(current->comm, "me.yuki.fina", 12) == 0 ||
-            strstr(current->comm, "fina") != NULL ||
-            strstr(current->comm, "sukisu") != NULL) {
-            /* BakaSU, FinaSU, and SukiSU native managers require UAPI 6 */
-            cmd.uapi_version = 6;
-        } else if (strncmp(current->comm, "yhaxhr", 6) == 0) {
-            /* KernelSU-Next v3.4.0 spoofed manager expects UAPI 4 */
-            cmd.uapi_version = 4;
-        } else if (strncmp(current->comm, "io.github.rifsx", 15) == 0 ||
-                   strncmp(current->comm, "com.rifsxd", 10) == 0 ||
-                   strstr(current->comm, "ksunext")) {
-            /* KernelSU-Next v3.4.2 official release manager expects UAPI 5 */
-            cmd.uapi_version = 5;
-        } else if (strncmp(current->comm, "me.weishu", 9) == 0 || sig_index == 1) {
-            /* Official KernelSU expects UAPI 4 */
-            cmd.uapi_version = 4;
-        } else if (is_manager()) {
-            /* Unknown / newly spoofed KernelSU-Next managers default to 5 */
-            cmd.uapi_version = 5;
+        if (detected_uapi >= 4 && detected_uapi <= 7) {
+            cmd.uapi_version = (u32)detected_uapi;
         } else {
-            /* ksud and root tools default to 5 */
-            cmd.uapi_version = 5;
+            /*
+             * Fallback for callers passing 0 (such as stock ksud) or if detection fails:
+             * Determine UAPI from crowned manager signature or default to 5.
+             */
+            int sig_index = -1;
+            if (is_manager()) {
+                sig_index = ksu_get_manager_signature_index_by_appid(ksu_get_uid_t(current_uid()) % PER_USER_RANGE);
+            } else if (ksu_last_manager_appid != KSU_INVALID_APPID) {
+                sig_index = ksu_get_manager_signature_index_by_appid(ksu_last_manager_appid);
+            }
+
+            /*
+             * Dynamic multi-manager UAPI negotiation fallback:
+             * - BakaSU, FinaSU, and SukiSU expect UAPI 6
+             * - KernelSU-Next v3.4.1 / v3.4.2+ expects UAPI 5
+             * - KernelSU-Next v3.4.0 (e.g. spoofed yhaxhr) expects UAPI 4
+             * - Official KernelSU (v0.9.x / v1.0.x) expects UAPI 4
+             * - ksud daemon / root tools expect UAPI 5
+             */
+            if (sig_index == 0 || sig_index == 5 || sig_index == 7 ||
+                strncmp(current->comm, "org.bakasu", 10) == 0 ||
+                strncmp(current->comm, "me.yuki.fina", 12) == 0 ||
+                strstr(current->comm, "fina") != NULL ||
+                strstr(current->comm, "sukisu") != NULL) {
+                /* BakaSU, FinaSU, and SukiSU native managers require UAPI 6 */
+                cmd.uapi_version = 6;
+            } else if (strncmp(current->comm, "yhaxhr", 6) == 0) {
+                /* KernelSU-Next v3.4.0 spoofed manager expects UAPI 4 */
+                cmd.uapi_version = 4;
+            } else if (strncmp(current->comm, "io.github.rifsx", 15) == 0 ||
+                       strncmp(current->comm, "com.rifsxd", 10) == 0 ||
+                       strstr(current->comm, "ksunext")) {
+                /* KernelSU-Next v3.4.2 official release manager expects UAPI 5 */
+                cmd.uapi_version = 5;
+            } else if (strncmp(current->comm, "me.weishu", 9) == 0 || sig_index == 1) {
+                /* Official KernelSU expects UAPI 4 */
+                cmd.uapi_version = 4;
+            } else if (is_manager()) {
+                /* Unknown / newly spoofed KernelSU-Next managers default to 5 */
+                cmd.uapi_version = 5;
+            } else {
+                /* ksud and root tools default to 5 */
+                cmd.uapi_version = 5;
+            }
         }
     }
 
