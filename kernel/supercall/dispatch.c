@@ -99,8 +99,11 @@ static int do_get_info(void __user *arg)
         if (sig_index == 0) {
             /* BakaSU native manager supports UAPI 6 */
             cmd.uapi_version = 6;
+        } else if (sig_index == 4 || is_manager()) {
+            /* KernelSU-Next v3.4.0 manager expects UAPI 4 */
+            cmd.uapi_version = 4;
         } else {
-            /* KernelSU-Next 3.4.2, FinaSU, Official KSU, etc. expect UAPI 5 */
+            /* ksud and root tools default to 5 */
             cmd.uapi_version = 5;
         }
     }
@@ -1498,6 +1501,18 @@ static const struct ksu_ioctl_cmd_map ksu_ioctl_handlers[] = {
         .perm_check = only_root
     },
     // downstream begin
+    {
+        .cmd = KSU_IOCTL_GET_HOOK_MODE_LEGACY,
+        .name = "GET_HOOK_MODE_LEGACY",
+        .handler = do_get_hook_type,
+        .perm_check = always_allow
+    },
+    {
+        .cmd = KSU_IOCTL_GET_VERSION_TAG_LEGACY,
+        .name = "GET_VERSION_TAG_LEGACY",
+        .handler = do_get_full_version,
+        .perm_check = always_allow
+    },
     { 
         .cmd = KSU_IOCTL_GET_FULL_VERSION,
         .name = "GET_FULL_VERSION",

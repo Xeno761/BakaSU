@@ -41,6 +41,7 @@ static apk_sign_key_t apk_sign_keys[] = {
     { EXPECTED_SIZE_FINASU, EXPECTED_HASH_FINASU },     // LyraVoid/FinaSU
     { EXPECTED_SIZE_RSUNTK, EXPECTED_HASH_RSUNTK },     // rsuntk/KernelSU (MKSU/RKSU)
     { EXPECTED_SIZE_SUKISU, EXPECTED_HASH_SUKISU },     // SukiSU-Ultra
+    { EXPECTED_SIZE_KSUNEXT_ALT, EXPECTED_HASH_KSUNEXT_ALT }, // KernelSU-Next Alt Key
 #ifdef EXPECTED_SIZE
     { EXPECTED_SIZE, EXPECTED_HASH }, // Custom
 #endif
