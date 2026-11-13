@@ -96,12 +96,31 @@ static int do_get_info(void __user *arg)
             sig_index = ksu_get_manager_signature_index_by_appid(ksu_last_manager_appid);
         }
 
-        if (sig_index == 0) {
+        /*
+         * Dynamic multi-manager UAPI negotiation:
+         * - BakaSU expects UAPI 6
+         * - KernelSU-Next v3.4.1 / v3.4.2+ expects UAPI 5
+         * - KernelSU-Next v3.4.0 (e.g. spoofed yhaxhr) expects UAPI 4
+         * - Official KernelSU (v0.9.x / v1.0.x) expects UAPI 4
+         * - ksud daemon / root tools expect UAPI 5
+         */
+        if (sig_index == 0 || strncmp(current->comm, "org.bakasu", 10) == 0) {
             /* BakaSU native manager supports UAPI 6 */
             cmd.uapi_version = 6;
-        } else if (sig_index == 4 || is_manager()) {
-            /* KernelSU-Next v3.4.0 manager expects UAPI 4 */
+        } else if (strncmp(current->comm, "yhaxhr", 6) == 0) {
+            /* KernelSU-Next v3.4.0 spoofed manager expects UAPI 4 */
             cmd.uapi_version = 4;
+        } else if (strncmp(current->comm, "io.github.rifsx", 15) == 0 ||
+                   strncmp(current->comm, "com.rifsxd", 10) == 0 ||
+                   strstr(current->comm, "ksunext")) {
+            /* KernelSU-Next v3.4.2 official release manager expects UAPI 5 */
+            cmd.uapi_version = 5;
+        } else if (strncmp(current->comm, "me.weishu", 9) == 0 || sig_index == 1) {
+            /* Official KernelSU expects UAPI 4 */
+            cmd.uapi_version = 4;
+        } else if (is_manager()) {
+            /* Unknown / newly spoofed KernelSU-Next managers default to 5 */
+            cmd.uapi_version = 5;
         } else {
             /* ksud and root tools default to 5 */
             cmd.uapi_version = 5;
