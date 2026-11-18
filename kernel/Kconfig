@@ -3,6 +3,7 @@ menu "KernelSU"
 config KSU
 	  tristate "KernelSU function support"
       select KALLSYMS
+      select ZLIB_INFLATE
 	  default y
 	  help
 		Enable kernel-level root privileges on Android System.

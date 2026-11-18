@@ -1,4 +1,5 @@
 #include "feature/selinux_hide.h"
+#include "feature/finasu_dynamic_manager.h"
 #include <linux/err.h>
 #include <linux/fs.h>
 #include <linux/namei.h>
@@ -36,6 +37,7 @@ void on_post_fs_data(void)
     ksu_feature_apply_forced();
 
     // scan manager
+    ksu_finasu_dynamic_manager_load();
     pr_info("post-fs-data triggered, scanning manager...");
     track_throne(0);
 }

@@ -19,7 +19,7 @@
 // 4: add KSU_GET_INFO_FLAG_BUNDLED
 // 5: add EVENT_SERVICES with a start/skip result
 // 6: add KSU_IOCTL_LOOKUP_SYMBOLS and KSU_GET_INFO_FLAG_PREINIT; modules.rc and preinit may live under /metadata/vold/ksu
-// Aphelion: Dynamic multi-UAPI support (negotiates 3..6, default 5 for KSUNext/FinaSU, 6 for BakaSU)
+// Aphelion: negotiate 3..6 or use the authenticated manager ABI; boot fallback is 6.
 static const __u32 KERNEL_SU_UAPI_VERSION = 6;
 
 /* Magic numbers for reboot hook to install fd */
@@ -46,7 +46,7 @@ struct ksu_get_info_cmd {
     __u32 version; /* Output: KERNEL_SU_VERSION */
     __u32 flags; /* Output: KSU_GET_INFO_FLAG_* bits */
     __u32 features; /* Output: max feature ID supported */
-    __u32 uapi_version; /* Output: KERNEL_SU_UAPI_VERSION */
+    __u32 uapi_version; /* Input: requested ABI (3..6) or 0; output: negotiated ABI */
 };
 
 struct ksu_get_info_legacy_cmd {
@@ -200,6 +200,30 @@ struct ksu_hook_type_cmd {
     char hook_type[32]; // Output: hook type string
 };
 
+struct ksu_get_hook_mode_legacy_cmd {
+    char mode[16];
+};
+
+struct ksu_get_version_tag_legacy_cmd {
+    char tag[32];
+};
+
+struct ksu_get_full_version_finasu_cmd {
+    char version_full[64];
+};
+
+struct ksu_finasu_try_umount_entry {
+    char path[256];
+    __u32 flags;
+    __u32 reserved;
+};
+
+struct ksu_finasu_get_try_umount_cmd {
+    __u32 count;
+    __u32 total_count;
+    __aligned_u64 entries;
+};
+
 DEFINE_KSU_UAPI_CONST(__u8, DYNAMIC_MANAGER_OP_SET, 0)
 DEFINE_KSU_UAPI_CONST(__u8, DYNAMIC_MANAGER_OP_GET, 1)
 DEFINE_KSU_UAPI_CONST(__u8, DYNAMIC_MANAGER_OP_WIPE, 2)
@@ -264,6 +288,8 @@ DEFINE_KSU_UAPI_CONST(__u32, KSU_IOCTL_LOOKUP_SYMBOLS, _IOW('K', 22, struct ksu_
 // Downstream add IOCTL command definitions
 DEFINE_KSU_UAPI_CONST(__u32, KSU_IOCTL_GET_HOOK_MODE_LEGACY, _IOC(_IOC_READ, 'K', 98, 0))
 DEFINE_KSU_UAPI_CONST(__u32, KSU_IOCTL_GET_VERSION_TAG_LEGACY, _IOC(_IOC_READ, 'K', 99, 0))
+DEFINE_KSU_UAPI_CONST(__u32, KSU_IOCTL_FINASU_GET_FULL_VERSION, _IOR('K', 29, struct ksu_get_full_version_finasu_cmd))
+DEFINE_KSU_UAPI_CONST(__u32, KSU_IOCTL_FINASU_GET_TRY_UMOUNT, _IOWR('K', 33, struct ksu_finasu_get_try_umount_cmd))
 DEFINE_KSU_UAPI_CONST(__u32, KSU_IOCTL_GET_FULL_VERSION, _IOC(_IOC_READ, 'K', 100, 0))
 DEFINE_KSU_UAPI_CONST(__u32, KSU_IOCTL_HOOK_TYPE, _IOC(_IOC_READ, 'K', 101, 0))
 // 102 = ENABLE_KPM (KernelPatch Module),deprecated

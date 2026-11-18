@@ -11,6 +11,8 @@
 #include <linux/stat.h>
 #include <linux/namei.h>
 #include <linux/kernel.h> // for container_of in UL
+#include <linux/mutex.h>
+#include <linux/task_work.h>
 
 #include "policy/allowlist.h"
 #include "manager/apk_sign.h"
@@ -19,9 +21,12 @@
 #include "manager/throne_tracker.h"
 #include "compat/kernel_compat.h"
 #include "feature/dynamic_manager.h"
+#include "feature/finasu_dynamic_manager.h"
 
 #define SYSTEM_PACKAGES_LIST_PATH "/data/system/packages.list"
 #define SYSTEM_PACKAGES_LIST_TMP_PATH "/data/system/packages.list.tmp"
+
+static DEFINE_MUTEX(throne_scan_mutex);
 
 struct uid_data {
     struct list_head list;
@@ -29,7 +34,7 @@ struct uid_data {
     char package[KSU_MAX_PACKAGE_NAME];
 };
 
-static void crown_manager(const char *apk, struct list_head *uid_data, u8 signature_index)
+static void crown_manager(const char *apk, struct list_head *uid_data, const struct ksu_manager_apk_info *info)
 {
     char pkg[KSU_MAX_PACKAGE_NAME];
     struct uid_data *np;
@@ -42,9 +47,13 @@ static void crown_manager(const char *apk, struct list_head *uid_data, u8 signat
 
     list_for_each_entry (np, uid_data, list) {
         if (strncmp(np->package, pkg, KSU_MAX_PACKAGE_NAME) == 0) {
-            pr_info("Crowning manager: %s uid=%d, signature_index=%d\n", pkg, np->uid, signature_index);
+            ksu_finasu_dynamic_manager_note_scanned(np->uid % PER_USER_RANGE, info->signature_index,
+                                                   info->certificate_size, info->certificate_hash);
+            if (!ksu_finasu_dynamic_manager_uid_allowed(np->uid, info->signature_index))
+                break;
+            pr_info("Crowning manager: %s uid=%d, signature_index=%d\n", pkg, np->uid, info->signature_index);
 
-            ksu_register_manager(np->uid, signature_index);
+            ksu_register_manager_with_uapi(np->uid, info->signature_index, info->uapi_version);
             break;
         }
     }
@@ -152,9 +161,11 @@ FILLDIR_RETURN_TYPE my_actor(MY_ACTOR_CTX_ARG, const char *name, int namelen, lo
 #define S_MAGIC_COMPAT(x) ((x)->f_path.dentry->d_inode->i_sb->s_magic)
 #endif
 
-void search_manager(const char *path, int depth, struct list_head *uid_data)
+static int search_manager(const char *path, int depth, struct list_head *uid_data, struct file *executable,
+                          u32 *uapi_version)
 {
     int i;
+    int matched_signature = -ENODATA;
     unsigned long data_app_magic = 0;
     struct apk_path_hash *pos, *n;
     struct list_head data_path_list;
@@ -182,7 +193,7 @@ void search_manager(const char *path, int depth, struct list_head *uid_data)
                 .depth = pos->depth,
             };
             struct file *file;
-            u8 signature_index = 0;
+            struct ksu_manager_apk_info info;
 
             // make sure to clean buffer on every iteration
             memset(candidate_path, 0, DATA_PATH_LEN);
@@ -221,13 +232,22 @@ void search_manager(const char *path, int depth, struct list_head *uid_data)
             if (!strstarts(candidate_path, "/data/ap"))
                 goto skip_iterate;
 
-            bool is_manager = is_manager_apk(candidate_path, &signature_index);
+            bool is_manager = ksu_get_manager_apk_info(candidate_path, &info);
             pr_info("Found new base.apk at path: %s, is_manager: %d\n", candidate_path, is_manager);
 
             if (likely(!is_manager))
                 goto skip_iterate;
 
-            crown_manager(candidate_path, uid_data, signature_index);
+            if (executable) {
+                if (ksu_manager_apk_matches_executable(candidate_path, executable)) {
+                    matched_signature = info.signature_index;
+                    if (uapi_version)
+                        *uapi_version = info.uapi_version;
+                    goto out;
+                }
+            } else {
+                crown_manager(candidate_path, uid_data, &info);
+            }
 
         skip_iterate:
             list_del(&pos->list);
@@ -235,6 +255,31 @@ void search_manager(const char *path, int depth, struct list_head *uid_data)
                 kfree(pos);
         }
     }
+out:
+    {
+        struct data_path *pos, *n;
+
+        list_for_each_entry_safe (pos, n, &data_path_list, list) {
+            list_del(&pos->list);
+            if (pos != &data)
+                kfree(pos);
+        }
+    }
+    return matched_signature;
+}
+
+int ksu_get_daemon_info(struct file *executable, u32 *uapi_version)
+{
+    const struct cred *old_cred;
+    int signature_index;
+
+    if (!executable)
+        return -ENODATA;
+
+    old_cred = override_creds(ksu_cred);
+    signature_index = search_manager("/data/app", 2, NULL, executable, uapi_version);
+    revert_creds(old_cred);
+    return signature_index;
 }
 
 static bool is_uid_exist(uid_t uid, char *package, void *data)
@@ -252,8 +297,14 @@ static bool is_uid_exist(uid_t uid, char *package, void *data)
     return exist;
 }
 
+int ksu_get_daemon_signature_index(struct file *executable)
+{
+    return ksu_get_daemon_info(executable, NULL);
+}
+
 struct track_throne_struct {
     unsigned int flags;
+    struct callback_head work;
 };
 
 void do_track_throne(void *data)
@@ -269,6 +320,9 @@ void do_track_throne(void *data)
     loff_t pos = 0;
     loff_t line_start = 0;
     char buf[KSU_MAX_PACKAGE_NAME];
+    u32 selected_appid;
+
+    mutex_lock(&throne_scan_mutex);
 
     // init uid list head
     INIT_LIST_HEAD(&uid_list);
@@ -343,11 +397,15 @@ void do_track_throne(void *data)
     if (flags & TRACK_THRONE_PRUNE_ONLY)
         goto prune;
 
-    // unregister all managers first
+    selected_appid = ksu_get_manager_appid();
+    ksu_finasu_dynamic_manager_reset_scanned();
     ksu_unregister_all_manager();
 
     pr_info("Searching for manager(s)...\n");
-    search_manager("/data/app", 2, &uid_list);
+    search_manager("/data/app", 2, &uid_list, NULL, NULL);
+    /* Restore the GUI selection only if its UID is still authenticated. */
+    if (selected_appid != KSU_INVALID_APPID)
+        ksu_mark_manager(selected_appid);
     pr_info("Manager search finished\n");
 
 prune:
@@ -360,12 +418,37 @@ out:
         kfree(np);
     }
     revert_creds(old_cred);
+    mutex_unlock(&throne_scan_mutex);
+}
+
+static void deferred_track_throne(struct callback_head *work)
+{
+    struct track_throne_struct *tts = container_of(work, struct track_throne_struct, work);
+
+    if (current->flags & PF_EXITING) {
+        kfree(tts);
+        return;
+    }
+    do_track_throne(tts);
 }
 
 void track_throne(unsigned int flags)
 {
     struct track_throne_struct *tts = kzalloc(sizeof(struct track_throne_struct), GFP_KERNEL);
+    if (!tts)
+        return;
     tts->flags = flags;
+
+    if (flags & TRACK_THRONE_FROM_RENAMEAT) {
+        /* Run after VFS releases rename locks, but before returning to Android. */
+        tts->flags &= ~TRACK_THRONE_FROM_RENAMEAT;
+        tts->work.func = deferred_track_throne;
+        if (task_work_add(current, &tts->work, TWA_RESUME)) {
+            pr_warn("Unable to defer manager rescan\n");
+            kfree(tts);
+        }
+        return;
+    }
 
     if (flags & TRACK_THRONE_FORCE_SYNCHRONOUS) {
         // usecase:
@@ -414,12 +497,7 @@ void ksu_handle_rename(struct dentry *old_dentry, struct dentry *new_dentry)
 
     pr_info("renameat: %s -> %s, new path: %s\n", old_dentry->d_iname, new_dentry->d_iname, buf);
 
-    // after renameat hook, packages.list.tmp -> packages.list
-    // don't async for it, or it will always have an race
-    // for example,
-    // we put track_throne task to init
-    // and user install an new app before task_work executed
-    // ^ race here
+    // Scan the published packages.list in the renamer's return-to-user task work.
     track_throne(TRACK_THRONE_FROM_RENAMEAT | TRACK_THRONE_FORCE_SYNCHRONOUS);
 }
 #endif

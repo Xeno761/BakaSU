@@ -24,6 +24,11 @@
 #include "feature/kernel_umount.h"
 #include "compat/kernel_compat.h"
 #include "manager/manager_identity.h"
+#include "manager/manager_sign.h"
+#include "manager/throne_tracker.h"
+#include "feature/finasu_dynamic_manager.h"
+#include "feature/finasu_uts_view.h"
+#include "feature/finasu_net_isolate.h"
 #include "selinux/selinux.h"
 #include "infra/file_wrapper.h"
 #ifdef CONFIG_KSU_TRACEPOINT_HOOK
@@ -66,67 +71,35 @@ static uint32_t ksuver_override = 0;
 static uint32_t ksuflags_override = 0;
 #endif
 
-static int detect_manager_uapi_version(void)
+static int get_caller_manager_info(u32 *uapi_version)
 {
-    struct mm_struct *mm = current->mm;
-    struct vma_iterator vmi;
-    struct vm_area_struct *vma;
-    struct file *so_file = NULL;
-    char *buf;
-    loff_t pos = 0;
-    ssize_t bytes_read;
-    int detected = -1;
-    u32 u;
+#ifndef CONFIG_KSU_DISABLE_MANAGER
+    u32 uid = ksu_get_uid_t(current_uid());
+    struct file *executable;
+    int signature_index;
 
-    if (!mm)
-        return -1;
-
-    if (!mmap_read_trylock(mm))
-        return -1;
-
-    vma_iter_init(&vmi, mm, 0);
-    for_each_vma(vmi, vma) {
-        if (vma->vm_file && vma->vm_file->f_path.dentry) {
-            const char *name = vma->vm_file->f_path.dentry->d_name.name;
-            if (name && strstr(name, "libkernelsu.so")) {
-                so_file = get_file(vma->vm_file);
-                break;
-            }
-        }
-    }
-    mmap_read_unlock(mm);
-
-    if (!so_file)
-        return -1;
-
-    buf = kmalloc(32768, GFP_KERNEL);
-    if (!buf) {
-        fput(so_file);
-        return -1;
+    if (uid) {
+        if (uapi_version)
+            *uapi_version = ksu_get_manager_uapi_by_appid(uid % PER_USER_RANGE);
+        return ksu_get_manager_signature_index_by_appid(uid % PER_USER_RANGE);
     }
 
-    bytes_read = ksu_kernel_read_compat(so_file, buf, 32768, &pos);
-    fput(so_file);
+    if (!current->mm)
+        return -ENODATA;
+    executable = get_mm_exe_file(current->mm);
+    if (!executable)
+        return -ENODATA;
+    signature_index = ksu_get_daemon_info(executable, uapi_version);
+    fput(executable);
+    return signature_index;
+#else
+    return -EOPNOTSUPP;
+#endif
+}
 
-    if (bytes_read > (ssize_t)(sizeof(u32) * 2)) {
-        for (u = 4; u <= 7; u++) {
-            u32 op_mov = 0x52800000 | (u << 5); /* mov w0, #u */
-            u32 op_ret = 0xd65f03c0;            /* ret */
-            ssize_t i;
-            for (i = 0; i <= bytes_read - 8; i += 4) {
-                u32 *p = (u32 *)(buf + i);
-                if (p[0] == op_mov && p[1] == op_ret) {
-                    detected = (int)u;
-                    break;
-                }
-            }
-            if (detected != -1)
-                break;
-        }
-    }
-
-    kfree(buf);
-    return detected;
+static int get_caller_signature_index(void)
+{
+    return get_caller_manager_info(NULL);
 }
 
 static int do_get_info(void __user *arg)
@@ -134,6 +107,8 @@ static int do_get_info(void __user *arg)
     struct ksu_get_info_cmd in_cmd = { 0 };
     struct ksu_get_info_cmd cmd = { .version = KERNEL_SU_VERSION, .flags = 0 };
     bool has_req_uapi = false;
+    u32 detected_uapi = 0;
+    int sig_index;
 
     if (!copy_from_user(&in_cmd, arg, sizeof(in_cmd))) {
         /*
@@ -147,58 +122,25 @@ static int do_get_info(void __user *arg)
         }
     }
 
+    sig_index = get_caller_manager_info(&detected_uapi);
+    if ((sig_index == KSU_SIG_FINASU || sig_index == KSU_SIGNATURE_INDEX_FINASU_DYNAMIC_MANAGER) && is_manager())
+        ksu_finasu_dynamic_manager_version_code(ksu_get_uid_t(current_uid()), &cmd.version);
     if (!has_req_uapi) {
-        int detected_uapi = -1;
-        if (is_manager()) {
-            detected_uapi = detect_manager_uapi_version();
-        }
-
-        if (detected_uapi >= 4 && detected_uapi <= 7) {
-            cmd.uapi_version = (u32)detected_uapi;
+        if (detected_uapi >= 3 && detected_uapi <= 6) {
+            cmd.uapi_version = detected_uapi;
         } else {
-            /*
-             * Fallback for callers passing 0 (such as stock ksud) or if detection fails:
-             * Determine UAPI from crowned manager signature or default to 5.
-             */
-            int sig_index = -1;
-            if (is_manager()) {
-                sig_index = ksu_get_manager_signature_index_by_appid(ksu_get_uid_t(current_uid()) % PER_USER_RANGE);
-            } else if (ksu_last_manager_appid != KSU_INVALID_APPID) {
-                sig_index = ksu_get_manager_signature_index_by_appid(ksu_last_manager_appid);
-            }
-
-            /*
-             * Dynamic multi-manager UAPI negotiation fallback:
-             * - BakaSU, FinaSU, and SukiSU expect UAPI 6
-             * - KernelSU-Next v3.4.1 / v3.4.2+ expects UAPI 5
-             * - KernelSU-Next v3.4.0 (e.g. spoofed yhaxhr) expects UAPI 4
-             * - Official KernelSU (v0.9.x / v1.0.x) expects UAPI 4
-             * - ksud daemon / root tools expect UAPI 5
-             */
-            if (sig_index == 0 || sig_index == 5 || sig_index == 7 ||
-                strncmp(current->comm, "org.bakasu", 10) == 0 ||
-                strncmp(current->comm, "me.yuki.fina", 12) == 0 ||
-                strstr(current->comm, "fina") != NULL ||
-                strstr(current->comm, "sukisu") != NULL) {
-                /* BakaSU, FinaSU, and SukiSU native managers require UAPI 6 */
-                cmd.uapi_version = 6;
-            } else if (strncmp(current->comm, "yhaxhr", 6) == 0) {
-                /* KernelSU-Next v3.4.0 spoofed manager expects UAPI 4 */
+            switch (sig_index) {
+            case KSU_SIG_OFFICIAL:
                 cmd.uapi_version = 4;
-            } else if (strncmp(current->comm, "io.github.rifsx", 15) == 0 ||
-                       strncmp(current->comm, "com.rifsxd", 10) == 0 ||
-                       strstr(current->comm, "ksunext")) {
-                /* KernelSU-Next v3.4.2 official release manager expects UAPI 5 */
+                break;
+            case KSU_SIG_KSUNEXT:
+            case KSU_SIG_KSUNEXT_ALT:
                 cmd.uapi_version = 5;
-            } else if (strncmp(current->comm, "me.weishu", 9) == 0 || sig_index == 1) {
-                /* Official KernelSU expects UAPI 4 */
-                cmd.uapi_version = 4;
-            } else if (is_manager()) {
-                /* Unknown / newly spoofed KernelSU-Next managers default to 5 */
-                cmd.uapi_version = 5;
-            } else {
-                /* ksud and root tools default to 5 */
-                cmd.uapi_version = 5;
+                break;
+            default:
+                /* Native ksud, including early init before /data/app is available. */
+                cmd.uapi_version = KERNEL_SU_UAPI_VERSION;
+                break;
             }
         }
     }
@@ -223,7 +165,25 @@ static int do_get_info(void __user *arg)
     else if (ksu_preinit_enabled_param()) {
         cmd.flags |= KSU_GET_INFO_FLAG_PREINIT;
     }
-    cmd.features = KSU_FEATURE_MAX;
+    switch (sig_index) {
+    case KSU_SIG_OFFICIAL:
+        cmd.features = cmd.uapi_version <= 4 ? 5 : KSU_FEATURE_MAX;
+        break;
+    case KSU_SIG_FINASU:
+    case KSU_SIGNATURE_INDEX_FINASU_DYNAMIC_MANAGER:
+        cmd.features = 11;
+        break;
+    case KSU_SIG_KSUNEXT:
+    case KSU_SIG_KSUNEXT_ALT:
+        cmd.features = cmd.uapi_version <= 4 ? KSU_FEATURE_MAX : 10004;
+        break;
+    case KSU_SIG_MILKSU:
+        cmd.features = 10004;
+        break;
+    default:
+        cmd.features = KSU_FEATURE_MAX;
+        break;
+    }
 
 #ifdef CONFIG_KSU_TOOLKIT_SUPPORT
     if (ksuver_override)
@@ -516,7 +476,26 @@ static int do_get_manager_appid(void __user *arg)
     struct ksu_get_manager_appid_cmd cmd;
 
 #ifndef CONFIG_KSU_DISABLE_MANAGER
-    cmd.appid = ksu_last_manager_appid;
+    u32 appid = ksu_get_manager_appid();
+    if (is_manager()) {
+        appid = ksu_get_uid_t(current_uid()) % PER_USER_RANGE;
+    } else if (ksu_get_uid_t(current_uid()) == 0) {
+        struct file *daemon = ksu_filp_open_nonotify("/data/adb/ksud", O_RDONLY | O_NOFOLLOW);
+
+        if (!IS_ERR(daemon)) {
+            int signature_index = ksu_get_daemon_signature_index(daemon);
+
+            fput(daemon);
+            if (signature_index >= 0) {
+                appid = ksu_get_manager_appid_by_signature(signature_index);
+                if (appid == KSU_INVALID_APPID) {
+                    track_throne(TRACK_THRONE_FORCE_SYNCHRONOUS);
+                    appid = ksu_get_manager_appid_by_signature(signature_index);
+                }
+            }
+        }
+    }
+    cmd.appid = appid == KSU_INVALID_APPID ? (u32)-1 : appid;
 #else
     cmd.appid = 0;
 #endif
@@ -585,9 +564,52 @@ static int do_set_app_profile(void __user *arg)
     return ret;
 }
 
+static u32 translate_feature_id_for_caller(u32 feature_id)
+{
+    int sig_index;
+
+    if ((feature_id < 5 || feature_id > 10) && feature_id != KSU_FEATURE_AVC_SPOOF)
+        return feature_id;
+
+    sig_index = get_caller_signature_index();
+    if (sig_index == KSU_SIG_FINASU || sig_index == KSU_SIGNATURE_INDEX_FINASU_DYNAMIC_MANAGER) {
+        switch (feature_id) {
+        case 5:
+            return KSU_FEATURE_FINASU_DYNAMIC_MANAGER;
+        case 6:
+            return KSU_FEATURE_AVC_SPOOF;
+        case 7:
+            return KSU_FEATURE_SHELL_SU_ADB_ONLY;
+        case 8:
+            return KSU_FEATURE_FINASU_DYNAMIC_MANAGER_GRANTS;
+        case 9:
+            return KSU_FEATURE_FINASU_UTS_VIEW;
+        case 10:
+            return KSU_FEATURE_FINASU_MOUNT_VIEW_FILTER;
+        }
+    }
+    if (feature_id == KSU_FEATURE_AVC_SPOOF &&
+        (sig_index == KSU_SIG_MILKSU || sig_index == KSU_SIG_KSUNEXT || sig_index == KSU_SIG_KSUNEXT_ALT))
+        return KSU_FEATURE_AVC_SPOOF_FULL;
+    return feature_id;
+}
+
+static bool finasu_or_root(void)
+{
+    int signature_index;
+
+    if (ksu_get_uid_t(current_uid()) == 0)
+        return true;
+    if (!is_manager())
+        return false;
+    signature_index = get_caller_signature_index();
+    return signature_index == KSU_SIG_FINASU || signature_index == KSU_SIGNATURE_INDEX_FINASU_DYNAMIC_MANAGER;
+}
+
 static int do_get_feature(void __user *arg)
 {
     struct ksu_get_feature_cmd cmd;
+    u32 feature_id;
     bool supported = false;
     int ret;
 
@@ -596,11 +618,12 @@ static int do_get_feature(void __user *arg)
         return -EFAULT;
     }
 
-    ret = ksu_get_feature(cmd.feature_id, &cmd.value, &supported);
+    feature_id = translate_feature_id_for_caller(cmd.feature_id);
+    ret = ksu_get_feature(feature_id, &cmd.value, &supported);
     cmd.supported = 0;
     if (supported) {
         cmd.supported |= KSU_FEATURE_FLAG_SUPPORTED;
-        if (ksu_feature_is_forced(cmd.feature_id)) {
+        if (ksu_feature_is_forced(feature_id)) {
             cmd.supported |= KSU_FEATURE_FLAG_FORCED;
         }
     }
@@ -628,7 +651,7 @@ static int do_set_feature(void __user *arg)
         return -EFAULT;
     }
 
-    ret = ksu_set_feature(cmd.feature_id, cmd.value);
+    ret = ksu_set_feature(translate_feature_id_for_caller(cmd.feature_id), cmd.value);
     if (ret) {
         pr_err("set_feature: failed for feature %u: %d\n", cmd.feature_id, ret);
         return ret;
@@ -976,6 +999,47 @@ static int manage_try_umount(void __user *arg)
     return 0;
 }
 
+static int do_get_try_umount(void __user *arg)
+{
+    struct ksu_finasu_get_try_umount_cmd cmd;
+    struct ksu_finasu_try_umount_entry *entries = NULL;
+    struct mount_entry *entry;
+    u32 capacity;
+    int ret = 0;
+
+    if (copy_from_user(&cmd, arg, sizeof(cmd)))
+        return -EFAULT;
+    capacity = min_t(u32, cmd.count, 256);
+    if (capacity) {
+        if (!cmd.entries)
+            return -EFAULT;
+        entries = kcalloc(capacity, sizeof(*entries), GFP_KERNEL);
+        if (!entries)
+            return -ENOMEM;
+    }
+    cmd.count = 0;
+    cmd.total_count = 0;
+    down_read(&mount_list_lock);
+    list_for_each_entry (entry, &mount_list, list) {
+        if (cmd.count < capacity) {
+            if (strscpy(entries[cmd.count].path, entry->umountable, sizeof(entries[cmd.count].path)) < 0) {
+                ret = -ENAMETOOLONG;
+                break;
+            }
+            entries[cmd.count].flags = entry->flags;
+            cmd.count++;
+        }
+        cmd.total_count++;
+    }
+    up_read(&mount_list_lock);
+    if (!ret && cmd.count && copy_to_user(u64_to_user_ptr(cmd.entries), entries, cmd.count * sizeof(*entries)))
+        ret = -EFAULT;
+    if (!ret && copy_to_user(arg, &cmd, sizeof(cmd)))
+        ret = -EFAULT;
+    kfree(entries);
+    return ret;
+}
+
 static int do_set_init_pgrp(void __user *arg)
 {
     int err;
@@ -1057,6 +1121,8 @@ static int do_lookup_symbols(void __user *arg)
     }
     if (!cmd.count || cmd.count > KSU_LOOKUP_SYMBOLS_MAX)
         return -EINVAL;
+    if (!cmd.names || !cmd.addrs)
+        return -EFAULT;
 
     // TODO overflow check backport
     names = vzalloc(cmd.count * sizeof(*names));
@@ -1133,6 +1199,39 @@ static int do_get_full_version(void __user *arg)
     }
 
     return 0;
+}
+
+static int do_get_version_tag_legacy(void __user *arg)
+{
+    struct ksu_get_version_tag_legacy_cmd cmd = { 0 };
+
+    strscpy(cmd.tag, KSU_VERSION_FULL, sizeof(cmd.tag));
+    return copy_to_user(arg, &cmd, sizeof(cmd)) ? -EFAULT : 0;
+}
+
+static int do_get_full_version_finasu(void __user *arg)
+{
+    struct ksu_get_full_version_finasu_cmd cmd = { 0 };
+
+    strscpy(cmd.version_full, KSU_VERSION_FULL, sizeof(cmd.version_full));
+    return copy_to_user(arg, &cmd, sizeof(cmd)) ? -EFAULT : 0;
+}
+
+static int do_get_hook_mode_legacy(void __user *arg)
+{
+    struct ksu_get_hook_mode_legacy_cmd cmd = { 0 };
+#if defined(CONFIG_KSU_TRACEPOINT_HOOK)
+    const char *type = "Tracepoint";
+#elif defined(CONFIG_KSU_MANUAL_HOOK)
+    const char *type = "Manual";
+#elif defined(CONFIG_KSU_SUSFS)
+    const char *type = "Inline";
+#else
+#error "Unsupported hook type"
+#endif
+
+    strscpy(cmd.mode, type, sizeof(cmd.mode));
+    return copy_to_user(arg, &cmd, sizeof(cmd)) ? -EFAULT : 0;
 }
 
 // 101. HOOK_TYPE - Get hook type
@@ -1442,6 +1541,78 @@ int ksu_try_handle_toolkit_cmd(int magic2, unsigned int cmd, void __user **arg)
 // IOCTL handlers mapping table
 // clang-format off
 static const struct ksu_ioctl_cmd_map ksu_ioctl_handlers[] = {
+    {
+        .cmd = KSU_FINASU_IOCTL_SET_DYNAMIC_MANAGERS,
+        .name = "FINASU_SET_DYNAMIC_MANAGERS",
+        .handler = ksu_finasu_dynamic_manager_set_managers,
+        .perm_check = only_root
+    },
+    {
+        .cmd = KSU_FINASU_IOCTL_GET_DYNAMIC_MANAGERS,
+        .name = "FINASU_GET_DYNAMIC_MANAGERS",
+        .handler = ksu_finasu_dynamic_manager_get_managers,
+        .perm_check = finasu_or_root
+    },
+    {
+        .cmd = KSU_FINASU_IOCTL_SET_DYNAMIC_MANAGER_GRANTS,
+        .name = "FINASU_SET_DYNAMIC_MANAGER_GRANTS",
+        .handler = ksu_finasu_dynamic_manager_set_grants,
+        .perm_check = only_root
+    },
+    {
+        .cmd = KSU_FINASU_IOCTL_GET_UTS_VIEW_CONFIG,
+        .name = "FINASU_GET_UTS_VIEW_CONFIG",
+        .handler = ksu_finasu_uts_view_get_config_handler,
+        .perm_check = finasu_or_root
+    },
+    {
+        .cmd = KSU_FINASU_IOCTL_SET_UTS_VIEW_CONFIG,
+        .name = "FINASU_SET_UTS_VIEW_CONFIG",
+        .handler = ksu_finasu_uts_view_set_config_handler,
+        .perm_check = finasu_or_root
+    },
+    {
+        .cmd = KSU_FINASU_IOCTL_GET_NETISOLATE_CONFIG,
+        .name = "FINASU_GET_NETISOLATE_CONFIG",
+        .handler = ksu_finasu_netisolate_get_config,
+        .perm_check = finasu_or_root
+    },
+    {
+        .cmd = KSU_FINASU_IOCTL_SET_NETISOLATE_CONFIG,
+        .name = "FINASU_SET_NETISOLATE_CONFIG",
+        .handler = ksu_finasu_netisolate_set_config,
+        .perm_check = finasu_or_root
+    },
+    {
+        .cmd = KSU_FINASU_IOCTL_GET_NETISOLATE_POLICIES,
+        .name = "FINASU_GET_NETISOLATE_POLICIES",
+        .handler = ksu_finasu_netisolate_get_policies,
+        .perm_check = finasu_or_root
+    },
+    {
+        .cmd = KSU_FINASU_IOCTL_SET_NETISOLATE_POLICIES,
+        .name = "FINASU_SET_NETISOLATE_POLICIES",
+        .handler = ksu_finasu_netisolate_set_policies,
+        .perm_check = finasu_or_root
+    },
+    {
+        .cmd = KSU_FINASU_IOCTL_GET_NETISOLATE_EVENTS,
+        .name = "FINASU_GET_NETISOLATE_EVENTS",
+        .handler = ksu_finasu_netisolate_get_events,
+        .perm_check = finasu_or_root
+    },
+    {
+        .cmd = KSU_FINASU_IOCTL_CLEAR_NETISOLATE_EVENTS,
+        .name = "FINASU_CLEAR_NETISOLATE_EVENTS",
+        .handler = ksu_finasu_netisolate_clear_events,
+        .perm_check = finasu_or_root
+    },
+    {
+        .cmd = KSU_IOCTL_FINASU_GET_TRY_UMOUNT,
+        .name = "FINASU_GET_TRY_UMOUNT",
+        .handler = do_get_try_umount,
+        .perm_check = finasu_or_root
+    },
     { 
         .cmd = KSU_IOCTL_GRANT_ROOT, 
         .name = "GRANT_ROOT", 
@@ -1598,13 +1769,19 @@ static const struct ksu_ioctl_cmd_map ksu_ioctl_handlers[] = {
     {
         .cmd = KSU_IOCTL_GET_HOOK_MODE_LEGACY,
         .name = "GET_HOOK_MODE_LEGACY",
-        .handler = do_get_hook_type,
+        .handler = do_get_hook_mode_legacy,
         .perm_check = always_allow
     },
     {
         .cmd = KSU_IOCTL_GET_VERSION_TAG_LEGACY,
         .name = "GET_VERSION_TAG_LEGACY",
-        .handler = do_get_full_version,
+        .handler = do_get_version_tag_legacy,
+        .perm_check = always_allow
+    },
+    {
+        .cmd = KSU_IOCTL_FINASU_GET_FULL_VERSION,
+        .name = "FINASU_GET_FULL_VERSION",
+        .handler = do_get_full_version_finasu,
         .perm_check = always_allow
     },
     { 

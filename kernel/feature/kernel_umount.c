@@ -119,9 +119,15 @@ int ksu_handle_umount(uid_t old_uid, uid_t new_uid)
         goto skip_umount_task;
     }
 
-    // if there isn't any module mounted, just ignore it!
+    // Explicit bind-mount entries still need processing before EVENT_MODULE_MOUNTED.
     if (!ksu_module_mounted) {
-        goto skip_umount_task;
+        bool pending;
+
+        down_read(&mount_list_lock);
+        pending = !list_empty(&mount_list);
+        up_read(&mount_list_lock);
+        if (!pending)
+            goto skip_umount_task;
     }
 
     // umount the target mnt

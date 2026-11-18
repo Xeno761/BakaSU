@@ -17,6 +17,10 @@
 #include "policy/allowlist.h"
 #include "policy/app_profile.h"
 #include "policy/feature.h"
+#include "feature/finasu_dynamic_manager.h"
+#include "feature/finasu_uts_view.h"
+#include "feature/finasu_mount_view_filter.h"
+#include "feature/finasu_net_isolate.h"
 #include "klog.h" // IWYU pragma: keep
 #include "manager/manager_observer.h"
 #include "manager/throne_tracker.h"
@@ -250,6 +254,20 @@ int __init kernelsu_init(void)
     ksu_selinux_hide_init();
     ksu_shell_su_adb_only_init();
 
+    ret = ksu_finasu_dynamic_manager_init(KSU_FEATURE_FINASU_DYNAMIC_MANAGER,
+                                        KSU_FEATURE_FINASU_DYNAMIC_MANAGER_GRANTS);
+    if (ret)
+        pr_warn("FinaSU dynamic managers unavailable: %d\n", ret);
+    ret = ksu_finasu_uts_view_init(KSU_FEATURE_FINASU_UTS_VIEW);
+    if (ret)
+        pr_warn("FinaSU UTS view unavailable: %d\n", ret);
+    ret = ksu_finasu_mount_view_filter_init(KSU_FEATURE_FINASU_MOUNT_VIEW_FILTER);
+    if (ret)
+        pr_warn("FinaSU mount view filter unavailable: %d\n", ret);
+    ret = ksu_finasu_netisolate_init();
+    if (ret)
+        pr_warn("FinaSU NetIsolate unavailable: %d\n", ret);
+
     ksu_supercalls_init();
     ksu_app_profile_init();
 
@@ -280,6 +298,7 @@ int __init kernelsu_init(void)
         ksu_file_wrapper_init();
 
         ksu_boot_completed = true;
+        ksu_finasu_dynamic_manager_load();
         track_throne(TRACK_THRONE_FORCE_SYNCHRONOUS);
 
         ksu_feature_apply_forced();
@@ -335,6 +354,10 @@ void __exit kernelsu_exit(void)
     ksu_allowlist_exit();
 
     ksu_shell_su_adb_only_exit();
+    ksu_finasu_netisolate_exit();
+    ksu_finasu_mount_view_filter_exit();
+    ksu_finasu_uts_view_exit();
+    ksu_finasu_dynamic_manager_exit();
     ksu_selinux_hide_exit();
     ksu_adb_root_exit();
     ksu_sulog_exit();

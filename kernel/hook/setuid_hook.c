@@ -19,6 +19,7 @@
 #include "hook/setuid_hook.h"
 #include "klog.h" // IWYU pragma: keep
 #include "manager/manager_identity.h"
+#include "feature/finasu_uts_view.h"
 #include "infra/seccomp_cache.h"
 #include "supercall/supercall.h"
 #ifdef CONFIG_KSU_TRACEPOINT_HOOK
@@ -70,9 +71,10 @@ static inline void ksu_set_file_immutable(const char *path_name, bool immutable)
 
 static inline void ksu_set_ksud_status(uid_t new_uid)
 {
-    u16 appid = new_uid % PER_USER_RANGE;
+    u32 appid = new_uid % PER_USER_RANGE;
+    ksu_finasu_uts_view_apply_for_uid(new_uid);
     int signature_index = ksu_get_manager_signature_index_by_appid(appid);
-    if (signature_index != 255) {
+    if (signature_index != KSU_SIGNATURE_INDEX_DYNAMIC_MANAGER) {
         ksu_set_file_immutable("/data/adb/ksud", false);
         pr_info("Mark /data/adb/ksud read write");
     } else {

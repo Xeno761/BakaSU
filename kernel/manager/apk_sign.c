@@ -5,6 +5,8 @@
 #include <linux/limits.h>
 #include <linux/slab.h>
 #include <linux/version.h>
+#include <linux/vmalloc.h>
+#include <linux/zlib.h>
 #ifdef CONFIG_KSU_DEBUG
 #include <linux/moduleparam.h>
 #endif
@@ -22,8 +24,10 @@
 #include "manager/manager_identity.h"
 #include "policy/app_profile.h"
 #include "feature/dynamic_manager.h"
+#include "feature/finasu_dynamic_manager.h"
 #include "klog.h" // IWYU pragma: keep
 #include "manager_sign.h"
+#include "apk_native.h"
 #include "compat/kernel_compat.h"
 
 struct sdesc {
@@ -32,17 +36,15 @@ struct sdesc {
 };
 
 static apk_sign_key_t apk_sign_keys[] = {
-    { EXPECTED_SIZE_BAKASU, EXPECTED_HASH_BAKASU }, /* Baka-SU/BakaSU */
+    [KSU_SIG_BAKASU] = { EXPECTED_SIZE_BAKASU, EXPECTED_HASH_BAKASU },
 #ifdef CONFIG_KSU_MULTI_MANAGER_SUPPORT
-    { EXPECTED_SIZE_OFFICIAL, EXPECTED_HASH_OFFICIAL }, // tiann/KernelSU
-    { EXPECTED_SIZE_KOWX712, EXPECTED_HASH_KOWX712 },   // KOWX712/KernelSU
-    { EXPECTED_SIZE_5EC1CFF, EXPECTED_HASH_5EC1CFF },   // 5ec1cff/KernelSU
-    { EXPECTED_SIZE_KSUNEXT, EXPECTED_HASH_KSUNEXT },   // KernelSU-Next v3.4.2
-    { EXPECTED_SIZE_FINASU, EXPECTED_HASH_FINASU },     // LyraVoid/FinaSU
-    { EXPECTED_SIZE_RSUNTK, EXPECTED_HASH_RSUNTK },     // rsuntk/KernelSU (MKSU/RKSU)
-    { EXPECTED_SIZE_SUKISU, EXPECTED_HASH_SUKISU },     // SukiSU-Ultra
-    { EXPECTED_SIZE_KSUNEXT_ALT, EXPECTED_HASH_KSUNEXT_ALT }, // KernelSU-Next Alt Key
-    { EXPECTED_SIZE_WILDKSU, EXPECTED_HASH_WILDKSU },         // Wild KSU v3.1.2
+    [KSU_SIG_OFFICIAL] = { EXPECTED_SIZE_OFFICIAL, EXPECTED_HASH_OFFICIAL },
+    [KSU_SIG_KSUNEXT] = { EXPECTED_SIZE_KSUNEXT, EXPECTED_HASH_KSUNEXT },
+    [KSU_SIG_FINASU] = { EXPECTED_SIZE_FINASU, EXPECTED_HASH_FINASU },
+    [KSU_SIG_SUKISU] = { EXPECTED_SIZE_SUKISU, EXPECTED_HASH_SUKISU },
+    [KSU_SIG_MILKSU] = { EXPECTED_SIZE_MILKSU, EXPECTED_HASH_MILKSU },
+    [KSU_SIG_WILDKSU] = { EXPECTED_SIZE_WILDKSU, EXPECTED_HASH_WILDKSU },
+    [KSU_SIG_KSUNEXT_ALT] = { EXPECTED_SIZE_KSUNEXT_ALT, EXPECTED_HASH_KSUNEXT_ALT },
 #ifdef EXPECTED_SIZE
     { EXPECTED_SIZE, EXPECTED_HASH }, // Custom
 #endif
@@ -118,7 +120,8 @@ static bool read_length_prefixed_end(struct file *fp, loff_t *pos, loff_t contai
     return true;
 }
 
-static bool check_block(struct file *fp, loff_t *pos, loff_t block_end, u8 *matched_index)
+static bool check_block(struct file *fp, loff_t *pos, loff_t block_end, u8 *matched_index,
+                        struct ksu_manager_apk_info *info)
 {
     u8 i;
     apk_sign_key_t sign_key;
@@ -161,13 +164,15 @@ static bool check_block(struct file *fp, loff_t *pos, loff_t block_end, u8 *matc
     hash_str[SHA256_DIGEST_SIZE * 2] = '\0';
 
     bin2hex(hash_str, digest, SHA256_DIGEST_SIZE);
+    info->certificate_size = certificate_size;
+    memcpy(info->certificate_hash, hash_str, sizeof(info->certificate_hash));
     pr_info("sha256: %s\n", hash_str);
 
     // keep 255, 254, 253 here
     // 255 reserved for dynamic manager
     // 254 reserved for ksu debug
     // 253 reserved for ksu toolkit
-    BUILD_BUG_ON(ARRAY_SIZE(apk_sign_keys) >= 253);
+    BUILD_BUG_ON(ARRAY_SIZE(apk_sign_keys) > KSU_SIGNATURE_INDEX_FINASU_DYNAMIC_MANAGER);
     for (i = 0; i < ARRAY_SIZE(apk_sign_keys); i++) {
         sign_key = apk_sign_keys[i];
         if (certificate_size == sign_key.size && strcmp(sign_key.sha256, hash_str) == 0) {
@@ -186,6 +191,11 @@ static bool check_block(struct file *fp, loff_t *pos, loff_t block_end, u8 *matc
             signature_valid = true;
         }
     }
+    if (!signature_valid && (ksu_finasu_dynamic_manager_signature_matches(certificate_size, hash_str) ||
+                             ksu_finasu_dynamic_manager_signature_is_preset(certificate_size, hash_str))) {
+        *matched_index = KSU_SIGNATURE_INDEX_FINASU_DYNAMIC_MANAGER;
+        signature_valid = true;
+    }
     return signature_valid;
 }
 
@@ -202,6 +212,250 @@ struct zip_entry_header {
     uint16_t file_name_length;
     uint16_t extra_field_length;
 } __attribute__((packed));
+
+struct zip_central_header {
+    __le32 signature;
+    __le16 version_made, version_needed, flags, compression, mod_time, mod_date;
+    __le32 crc32, compressed_size, uncompressed_size;
+    __le16 file_name_length, extra_field_length, comment_length, disk, internal_attr;
+    __le32 external_attr, local_offset;
+} __attribute__((packed));
+
+struct zip_eocd {
+    __le32 signature;
+    __le16 disk, central_disk, disk_entries, entries;
+    __le32 central_size, central_offset;
+    __le16 comment_length;
+} __attribute__((packed));
+
+static bool get_zip_central_directory(struct file *fp, loff_t file_size, loff_t *offset, loff_t *end)
+{
+    struct zip_eocd eocd;
+    unsigned int comment;
+
+    for (comment = 0; comment <= 0xffff; comment++) {
+        loff_t start = file_size - sizeof(eocd) - comment;
+        loff_t pos = start;
+        loff_t size;
+
+        if (!read_exact(fp, &eocd, sizeof(eocd), &pos, file_size))
+            return false;
+        if (le32_to_cpu(eocd.signature) != 0x06054b50 || le16_to_cpu(eocd.comment_length) != comment)
+            continue;
+        if (eocd.disk || eocd.central_disk || eocd.disk_entries != eocd.entries)
+            return false;
+
+        *offset = le32_to_cpu(eocd.central_offset);
+        size = le32_to_cpu(eocd.central_size);
+        if (*offset > start || size > start - *offset)
+            return false;
+        *end = *offset + size;
+        return true;
+    }
+    return false;
+}
+
+static bool executable_matches_range(struct file *fp, loff_t start, loff_t size, struct file *executable)
+{
+    char *buf;
+    loff_t pos = start, exe_pos = 0, end;
+    loff_t file_size = i_size_read(file_inode(fp));
+    bool matched = false;
+
+    if (start < 0 || size <= 0 || start > file_size || size > file_size - start ||
+        size != i_size_read(file_inode(executable)))
+        return false;
+    end = start + size;
+
+    buf = kmalloc(8192, GFP_KERNEL);
+    if (!buf)
+        return false;
+
+    while (exe_pos < size) {
+        size_t count = min_t(loff_t, 4096, size - exe_pos);
+
+        if (!read_exact(fp, buf, count, &pos, end) ||
+            !read_exact(executable, buf + 4096, count, &exe_pos, size) || memcmp(buf, buf + 4096, count))
+            goto out;
+    }
+    matched = true;
+out:
+    kfree(buf);
+    return matched;
+}
+
+static bool executable_matches_deflated_range(struct file *fp, loff_t start, u32 compressed_size, u32 size,
+                                             struct file *executable)
+{
+    z_stream stream = { 0 };
+    loff_t file_size = i_size_read(file_inode(fp));
+    loff_t pos = start, exe_pos = 0, end;
+    unsigned char *buf;
+    bool matched = false;
+    int ret;
+
+    if (start < 0 || !compressed_size || !size || start > file_size || compressed_size > file_size - start ||
+        size != i_size_read(file_inode(executable)))
+        return false;
+    end = start + compressed_size;
+
+    buf = kmalloc(12288, GFP_KERNEL);
+    if (!buf)
+        return false;
+    stream.workspace = vzalloc(zlib_inflate_workspacesize());
+    if (!stream.workspace)
+        goto out;
+    if (zlib_inflateInit2(&stream, -MAX_WBITS) != Z_OK)
+        goto free_workspace;
+
+    for (;;) {
+        unsigned long old_in = stream.total_in;
+        size_t count;
+
+        if (!stream.avail_in && pos < end) {
+            count = min_t(loff_t, 4096, end - pos);
+            if (!read_exact(fp, buf, count, &pos, end))
+                break;
+            stream.next_in = buf;
+            stream.avail_in = count;
+        }
+
+        stream.next_out = buf + 4096;
+        stream.avail_out = 4096;
+        ret = zlib_inflate(&stream, Z_NO_FLUSH);
+        count = 4096 - stream.avail_out;
+        if (count && (!read_exact(executable, buf + 8192, count, &exe_pos, size) ||
+                      memcmp(buf + 4096, buf + 8192, count)))
+            break;
+        if (ret == Z_STREAM_END) {
+            matched = exe_pos == size && stream.total_in == compressed_size;
+            break;
+        }
+        if (ret != Z_OK || (!count && stream.total_in == old_in))
+            break;
+    }
+
+    zlib_inflateEnd(&stream);
+free_workspace:
+    vfree(stream.workspace);
+out:
+    kfree(buf);
+    return matched;
+}
+
+static int native_payload_uapi(struct file *fp, loff_t start, u32 compressed_size, u32 size, u16 compression)
+{
+    void *data, *compressed = NULL;
+    loff_t pos = start, file_size = i_size_read(file_inode(fp));
+    int ret = -ENODATA;
+
+    /* JNI metadata is small; never allocate for an entire daemon or a ZIP bomb. */
+    if (!size || size > 2 * 1024 * 1024 || compressed_size > 2 * 1024 * 1024 + 65536 ||
+        start < 0 || start > file_size || compressed_size > file_size - start)
+        return ret;
+    data = kvmalloc(size, GFP_KERNEL);
+    if (!data)
+        return -ENOMEM;
+    if (!compression) {
+        if (!read_exact(fp, data, size, &pos, file_size))
+            goto out;
+    } else {
+        compressed = kvmalloc(compressed_size, GFP_KERNEL);
+        if (!compressed || !read_exact(fp, compressed, compressed_size, &pos, file_size) ||
+            zlib_inflate_blob(data, size, compressed, compressed_size) != size)
+            goto out;
+    }
+    ret = ksu_apk_native_uapi_version(data, size);
+out:
+    kvfree(compressed);
+    kvfree(data);
+    return ret;
+}
+
+/* Match signed payloads or read only their named native ABI getter. */
+static bool scan_apk_native_payloads(const char *path, struct file *executable, u32 *uapi_version)
+{
+    static const char jni_prefix[] = "lib/arm64-v8a/";
+    struct zip_central_header central;
+    struct zip_entry_header local;
+    struct file *fp;
+    loff_t pos, end, file_size;
+    bool matched = false;
+    char name[128], local_name[128];
+
+    fp = ksu_filp_open_nonotify(path, O_RDONLY | O_NOFOLLOW);
+    if (IS_ERR(fp))
+        return false;
+
+    file_size = i_size_read(file_inode(fp));
+    if (!get_zip_central_directory(fp, file_size, &pos, &end))
+        goto close_apk;
+
+    while (pos < end) {
+        loff_t next, local_pos;
+        u16 name_len, compression;
+        u32 size, compressed_size;
+
+        if (!read_exact(fp, &central, sizeof(central), &pos, end) ||
+            le32_to_cpu(central.signature) != 0x02014b50)
+            break;
+        name_len = le16_to_cpu(central.file_name_length);
+        next = pos + name_len + le16_to_cpu(central.extra_field_length) + le16_to_cpu(central.comment_length);
+        if (next > end)
+            break;
+        size = le32_to_cpu(central.uncompressed_size);
+        if (name_len <= sizeof(jni_prefix) - 1 + 3 || name_len >= sizeof(name) ||
+            (executable && size != i_size_read(file_inode(executable))) ||
+            !read_exact(fp, name, name_len, &pos, end) ||
+            memcmp(name, jni_prefix, sizeof(jni_prefix) - 1) || memcmp(name + name_len - 3, ".so", 3)) {
+            pos = next;
+            continue;
+        }
+
+        compression = le16_to_cpu(central.compression);
+        compressed_size = le32_to_cpu(central.compressed_size);
+        if ((compression != 0 && compression != 8) || (le16_to_cpu(central.flags) & 1) ||
+            (compression == 0 && compressed_size != size))
+            break;
+        local_pos = le32_to_cpu(central.local_offset);
+        if (!read_exact(fp, &local, sizeof(local), &local_pos, file_size) || local.signature != 0x04034b50 ||
+            local.compression != compression || local.file_name_length != name_len || (local.flags & 1) ||
+            !read_exact(fp, local_name, name_len, &local_pos, file_size) || memcmp(name, local_name, name_len))
+            break;
+        local_pos += local.extra_field_length;
+        if (!executable) {
+            int uapi = native_payload_uapi(fp, local_pos, compressed_size, size, compression);
+
+            if (uapi >= 3 && uapi <= 6) {
+                if (*uapi_version && *uapi_version != uapi) {
+                    *uapi_version = 0;
+                    break;
+                }
+                *uapi_version = uapi;
+            } else if (uapi == -EPROTO) {
+                *uapi_version = 0;
+                break;
+            }
+            pos = next;
+            continue;
+        }
+        if (compression == 8)
+            matched = executable_matches_deflated_range(fp, local_pos, compressed_size, size, executable);
+        else
+            matched = executable_matches_range(fp, local_pos, size, executable);
+        if (matched)
+            break;
+        pos = next;
+    }
+close_apk:
+    filp_close(fp, NULL);
+    return matched;
+}
+
+bool ksu_manager_apk_matches_executable(const char *path, struct file *executable)
+{
+    return executable && scan_apk_native_payloads(path, executable, NULL);
+}
 
 // This is a necessary but not sufficient condition, but it is enough for us
 static bool has_v1_signature_file(struct file *fp)
@@ -239,18 +493,16 @@ static bool has_v1_signature_file(struct file *fp)
     return false;
 }
 
-static __always_inline bool check_v2_signature(char *path, u8 *signature_index)
+static __always_inline bool check_v2_signature(char *path, struct ksu_manager_apk_info *info)
 {
     unsigned char buffer[0x10] = { 0 };
-    u32 cd_offset;
     u64 size_of_block, size_of_block_at_head;
 
-    loff_t pos, pairs_end, file_size;
+    loff_t pos, pairs_end, file_size, cd_offset, cd_end;
 
     bool v2_signing_valid = false;
     int v2_signing_blocks = 0;
     u8 matched_index = -1;
-    int i;
     struct file *fp = ksu_filp_open_nonotify(path, O_RDONLY | O_NOATIME);
     if (IS_ERR(fp)) {
         pr_err("open %s error.\n", path);
@@ -261,30 +513,7 @@ static __always_inline bool check_v2_signature(char *path, u8 *signature_index)
     if (file_size < 0)
         goto clean;
 
-    // https://en.wikipedia.org/wiki/Zip_(file_format)#End_of_central_directory_record_(EOCD)
-    for (i = 0;; ++i) {
-        unsigned short comment_size;
-        u32 magic;
-        pos = file_size - i - 2;
-        if (!read_exact(fp, &comment_size, sizeof(comment_size), &pos, file_size))
-            goto clean;
-        if (comment_size == i) {
-            pos -= 22;
-            if (!read_exact(fp, &magic, sizeof(magic), &pos, file_size))
-                goto clean;
-            if (magic == 0x06054b50) {
-                break;
-            }
-        }
-        if (i == 0xffff) {
-            pr_info("error: cannot find eocd\n");
-            goto clean;
-        }
-    }
-
-    pos += 12;
-    // offset of central directory
-    if (!read_exact(fp, &cd_offset, sizeof(cd_offset), &pos, file_size))
+    if (!get_zip_central_directory(fp, file_size, &cd_offset, &cd_end))
         goto clean;
     if (cd_offset < 0x20)
         goto clean;
@@ -327,7 +556,7 @@ static __always_inline bool check_v2_signature(char *path, u8 *signature_index)
 
         if (id == 0x7109871au) {
             v2_signing_blocks++;
-            v2_signing_valid = check_block(fp, &pos, pair_end, &matched_index);
+            v2_signing_valid = check_block(fp, &pos, pair_end, &matched_index, info);
         } else if (id != 0x42726577u) { // APK verity padding
             // https://cs.android.com/android/platform/superproject/+/android-latest-release:tools/apksig/src/main/java/com/android/apksig/internal/apk/ApkSigningBlockUtils.java;l=102;drc=ebe4dfd4fd6550c949a6c7c2427484bf5e96500b
 #ifdef CONFIG_KSU_DEBUG
@@ -360,9 +589,7 @@ clean:
     filp_close(fp, 0);
 
     if (v2_signing_valid) {
-        if (signature_index) {
-            *signature_index = matched_index;
-        }
+        info->signature_index = matched_index;
 
         return true;
     }
@@ -429,8 +656,9 @@ int get_pkg_from_apk_path(char *pkg, const char *path)
     return 0;
 }
 
-bool is_manager_apk(char *path, u8 *signature_index)
+bool ksu_get_manager_apk_info(char *path, struct ksu_manager_apk_info *info)
 {
+    memset(info, 0, sizeof(*info));
 #ifdef KSU_MANAGER_PACKAGE
     char pkg[KSU_MAX_PACKAGE_NAME];
     if (get_pkg_from_apk_path(pkg, path) < 0) {
@@ -443,5 +671,18 @@ bool is_manager_apk(char *path, u8 *signature_index)
         return false;
     }
 #endif
-    return check_v2_signature(path, signature_index);
+    if (!check_v2_signature(path, info))
+        return false;
+    scan_apk_native_payloads(path, NULL, &info->uapi_version);
+    return true;
+}
+
+bool is_manager_apk(char *path, u8 *signature_index)
+{
+    struct ksu_manager_apk_info info;
+    bool matched = ksu_get_manager_apk_info(path, &info);
+
+    if (matched && signature_index)
+        *signature_index = info.signature_index;
+    return matched;
 }

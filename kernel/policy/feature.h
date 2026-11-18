@@ -4,6 +4,13 @@
 #include <linux/types.h>
 #include "uapi/feature.h" // IWYU pragma: keep
 
+#define KSU_FEATURE_AVC_SPOOF_FULL 10004
+#define KSU_FEATURE_FINASU_DYNAMIC_MANAGER 10010
+#define KSU_FEATURE_FINASU_DYNAMIC_MANAGER_GRANTS 10011
+#define KSU_FEATURE_FINASU_UTS_VIEW 10012
+#define KSU_FEATURE_FINASU_MOUNT_VIEW_FILTER 10013
+#define KSU_FEATURE_SLOT_COUNT (KSU_FEATURE_MAX + 6)
+
 typedef int (*ksu_feature_get_t)(u64 *value);
 typedef int (*ksu_feature_set_t)(u64 value);
 
